@@ -9,6 +9,7 @@ import argparse
 import html
 import sys
 from collections import Counter
+from urllib.request import urlopen
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -74,6 +75,30 @@ CURATED: dict[str, dict[str, str]] = {
     "rs17822931": {"gene": "ABCC11", "risk": "A", "label": "earwax"},
     "rs2814778": {"gene": "DARC", "risk": "C", "label": "duffy"},
 }
+
+
+
+REF_URLS = {
+    "gwas": "https://www.ebi.ac.uk/gwas/api/search/downloads/alternative",
+    "clinvar": "https://ftp.ncbi.nlm.nih.gov/pub/clinvar/vcf_GRCh38/clinvar.vcf.gz",
+}
+
+
+def download_url(url: str, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with urlopen(url) as response, dest.open("wb") as f:
+        total = int(response.headers.get("Content-Length", 0) or 0)
+        done = 0
+        while True:
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                break
+            f.write(chunk)
+            done += len(chunk)
+            if total:
+                print(f"{dest.name}: {done/1024/1024:.1f} / {total/1024/1024:.1f} MB", end="\r")
+        if total:
+            print()
 
 
 def parse_raw(path: Path) -> dict[str, str]:
@@ -348,6 +373,30 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     return 0
 
 
+
+def cmd_download_refs(args: argparse.Namespace) -> int:
+    """Download optional public reference files for advanced/local experimentation."""
+    data_dir = Path(args.dir)
+    print("Optional references are NOT required for the default human HTML report.")
+    print("They are downloaded only if you want to build your own expanded annotation pipeline.")
+    jobs = []
+    if args.gwas or args.all:
+        jobs.append(("gwas", data_dir / "gwas_catalog.tsv"))
+    if args.clinvar or args.all:
+        jobs.append(("clinvar", data_dir / "clinvar.vcf.gz"))
+    if not jobs:
+        print("Nothing selected. Use --all, --gwas, or --clinvar.")
+        return 2
+    for key, dest in jobs:
+        if dest.exists() and not args.force:
+            print(f"skip existing: {dest}")
+            continue
+        print(f"Downloading {key}: {REF_URLS[key]}")
+        download_url(REF_URLS[key], dest)
+        print(f"saved: {dest}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="chip_atlas.py", description="Generate a human-readable HTML report from Atlas/23andMe raw DNA TSV.")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -359,6 +408,14 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--out", "-o", default="output/chip_atlas_report.html")
     a.add_argument("--md", help="Optional Markdown output path")
     a.set_defaults(func=cmd_analyze)
+
+    r = sub.add_parser("download-refs", help="Download optional public GWAS/ClinVar references (large; not needed for default report)")
+    r.add_argument("--dir", default="data", help="Destination directory")
+    r.add_argument("--all", action="store_true", help="Download all optional references")
+    r.add_argument("--gwas", action="store_true", help="Download GWAS Catalog TSV")
+    r.add_argument("--clinvar", action="store_true", help="Download ClinVar VCF.gz")
+    r.add_argument("--force", action="store_true", help="Overwrite existing files")
+    r.set_defaults(func=cmd_download_refs)
     return p
 
 

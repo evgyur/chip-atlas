@@ -64,3 +64,15 @@ The tool runs locally. It does not upload your DNA data anywhere.
 ## Disclaimer
 
 This is educational software, not a medical device. Do not change medication, supplements, pregnancy plans, or medical treatment based only on this report. Confirm important findings with a doctor and a certified clinical lab.
+
+## Optional large references
+
+The default report is intentionally lightweight: it uses a curated built-in marker panel and does **not** require downloading gigabytes of reference data.
+
+The older internal prototype also experimented with GWAS Catalog / ClinVar local references. If you want to build an expanded local annotation database, you can download public references:
+
+```bash
+python3 bin/chip_atlas.py download-refs --all --dir data
+```
+
+Approximate size can be large (hundreds of MB to >1GB depending on source versions). These files are ignored by git and are not required for the default HTML report.

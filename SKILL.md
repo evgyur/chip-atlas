@@ -79,3 +79,15 @@ A good run should:
 3. detect key curated markers when present;
 4. generate a standalone `.html` report that opens in a browser;
 5. avoid exposing or storing secrets.
+
+## Optional large references
+
+Default mode is lightweight and uses an embedded curated marker panel. It does **not** need GWAS/ClinVar downloads.
+
+For advanced local experiments, optional public references can be downloaded:
+
+```bash
+python3 bin/chip_atlas.py download-refs --all --dir data
+```
+
+These files can be large and are ignored by git. The current default human HTML report does not depend on them.
