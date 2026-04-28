@@ -6,6 +6,7 @@ Educational only. Not medical advice.
 from __future__ import annotations
 
 import argparse
+import gzip
 import html
 import sys
 from collections import Counter
@@ -78,10 +79,23 @@ CURATED: dict[str, dict[str, str]] = {
 
 
 
-REF_URLS = {
-    "gwas": "https://www.ebi.ac.uk/gwas/api/search/downloads/alternative",
-    "clinvar": "https://ftp.ncbi.nlm.nih.gov/pub/clinvar/vcf_GRCh38/clinvar.vcf.gz",
+REF_SOURCES = {
+    "gwas": {
+        "name": "GWAS Catalog associations TSV",
+        "url": "https://www.ebi.ac.uk/gwas/api/search/downloads/alternative",
+        "file": "gwas_catalog.tsv",
+        "size": "~150–500 MB (changes over time)",
+        "why": "broad research associations between rsID markers and published traits",
+    },
+    "clinvar": {
+        "name": "ClinVar GRCh38 VCF",
+        "url": "https://ftp.ncbi.nlm.nih.gov/pub/clinvar/vcf_GRCh38/clinvar.vcf.gz",
+        "file": "clinvar.vcf.gz",
+        "size": "~100–300 MB compressed, larger when processed",
+        "why": "clinical-reference submissions that should be confirmed with a doctor/lab",
+    },
 }
+REF_URLS = {k: v["url"] for k, v in REF_SOURCES.items()}
 
 
 def download_url(url: str, dest: Path) -> None:
@@ -225,6 +239,113 @@ def stats_for(snps: dict[str, str]) -> dict[str, object]:
     return {"total": len(snps), "curated_found": sum(1 for rs in CURATED if rs in snps)}
 
 
+def _open_text(path: Path):
+    if path.suffix == ".gz":
+        return gzip.open(path, "rt", encoding="utf-8", errors="replace")
+    return path.open("r", encoding="utf-8", errors="replace")
+
+
+def _split_info(info: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for part in info.split(";"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            out[k] = v.replace("_", " ").replace("%2C", ",")
+    return out
+
+
+def load_reference_hits(snps: dict[str, str], refs_dir: Path, max_hits: int = 80) -> dict[str, list[dict[str, str]]]:
+    """Best-effort local matching of raw rsIDs against downloaded public references."""
+    rsids = set(snps)
+    hits: dict[str, list[dict[str, str]]] = {"gwas": [], "clinvar": []}
+
+    gwas = refs_dir / REF_SOURCES["gwas"]["file"]
+    if gwas.exists():
+        try:
+            with _open_text(gwas) as f:
+                header = f.readline().rstrip("\n").split("\t")
+                idx = {name: i for i, name in enumerate(header)}
+                snp_i = idx.get("SNPS")
+                trait_i = idx.get("DISEASE/TRAIT")
+                gene_i = idx.get("MAPPED_GENE")
+                risk_i = idx.get("STRONGEST SNP-RISK ALLELE")
+                p_i = idx.get("P-VALUE")
+                if snp_i is not None:
+                    for line in f:
+                        parts = line.rstrip("\n").split("\t")
+                        if len(parts) <= snp_i:
+                            continue
+                        found = [rs.strip() for rs in parts[snp_i].replace(";", ",").split(",") if rs.strip() in rsids]
+                        if not found:
+                            continue
+                        hits["gwas"].append({
+                            "rsid": ", ".join(found[:3]),
+                            "genotype": ", ".join(f"{rs}={snps.get(rs, '')}" for rs in found[:3]),
+                            "trait": parts[trait_i] if trait_i is not None and len(parts) > trait_i else "",
+                            "gene": parts[gene_i] if gene_i is not None and len(parts) > gene_i else "",
+                            "risk": parts[risk_i] if risk_i is not None and len(parts) > risk_i else "",
+                            "p": parts[p_i] if p_i is not None and len(parts) > p_i else "",
+                        })
+                        if len(hits["gwas"]) >= max_hits:
+                            break
+        except Exception as e:
+            hits["gwas"].append({"rsid": "error", "trait": f"Could not parse GWAS reference: {e}", "genotype": "", "gene": "", "risk": "", "p": ""})
+
+    clinvar = refs_dir / REF_SOURCES["clinvar"]["file"]
+    if clinvar.exists():
+        try:
+            with _open_text(clinvar) as f:
+                for line in f:
+                    if line.startswith("#"):
+                        continue
+                    parts = line.rstrip("\n").split("\t")
+                    if len(parts) < 8:
+                        continue
+                    ids = [x for x in parts[2].split(";") if x in rsids]
+                    if not ids:
+                        continue
+                    info = _split_info(parts[7])
+                    hits["clinvar"].append({
+                        "rsid": ", ".join(ids[:3]),
+                        "genotype": ", ".join(f"{rs}={snps.get(rs, '')}" for rs in ids[:3]),
+                        "trait": info.get("CLNDN", ""),
+                        "gene": info.get("GENEINFO", ""),
+                        "significance": info.get("CLNSIG", ""),
+                    })
+                    if len(hits["clinvar"]) >= max_hits:
+                        break
+        except Exception as e:
+            hits["clinvar"].append({"rsid": "error", "trait": f"Could not parse ClinVar reference: {e}", "genotype": "", "gene": "", "significance": ""})
+
+    return hits
+
+
+def render_reference_section(ref_hits: dict[str, list[dict[str, str]]] | None) -> str:
+    if not ref_hits:
+        return ""
+    blocks = []
+    gwas = ref_hits.get("gwas") or []
+    if gwas:
+        rows = []
+        for h in gwas[:40]:
+            rows.append(f"<li><b>{html.escape(h.get('trait','')[:120])}</b> — {html.escape(h.get('rsid',''))} ({html.escape(h.get('genotype',''))}); gene: {html.escape(h.get('gene','')[:80])}; risk: {html.escape(h.get('risk','')[:80])}</li>")
+        blocks.append(f"<h3>GWAS Catalog: исследовательские ассоциации</h3><ul>{''.join(rows)}</ul>")
+    clinvar = ref_hits.get("clinvar") or []
+    if clinvar:
+        rows = []
+        for h in clinvar[:40]:
+            rows.append(f"<li><b>{html.escape(h.get('trait','')[:120])}</b> — {html.escape(h.get('rsid',''))} ({html.escape(h.get('genotype',''))}); gene: {html.escape(h.get('gene','')[:80])}; ClinVar: {html.escape(h.get('significance','')[:80])}</li>")
+        blocks.append(f"<h3>ClinVar: совпадения, которые требуют проверки</h3><ul>{''.join(rows)}</ul>")
+    if not blocks:
+        return ""
+    return f'''
+<div class="card">
+  <h2>🔬 Расширенные публичные базы</h2>
+  <div class="tip">Это не диагноз. Это локальные совпадения raw DNA с публичными справочниками. Их задача — дать материал для глубокого разбора и список тем, которые можно подтвердить с врачом/лабораторией.</div>
+  {''.join(blocks)}
+</div>'''
+
+
 def pill_class(tone: str) -> str:
     return {"red": "pill-red", "yellow": "pill-yellow", "green": "pill-green", "blue": "pill-blue"}.get(tone, "pill-blue")
 
@@ -268,7 +389,7 @@ def build_checklist() -> list[str]:
     ]
 
 
-def render_html(snps: dict[str, str], markers: list[Marker]) -> str:
+def render_html(snps: dict[str, str], markers: list[Marker], ref_hits: dict[str, list[dict[str, str]]] | None = None) -> str:
     now = datetime.now().strftime("%Y-%m-%d")
     by_cat: dict[str, list[Marker]] = {k: [] for k in ["meds", "food", "heart", "sport", "stress", "skin", "ancestry"]}
     for m in markers:
@@ -319,6 +440,7 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans
 {render_section('🧠 Стресс, сон и нервная система', by_cat.get('stress', []))}
 {render_section('☀️ Кожа и солнце', by_cat.get('skin', []))}
 {render_section('🧬 Происхождение', by_cat.get('ancestry', []))}
+{render_reference_section(ref_hits)}
 
 <div class="card">
   <h2>📋 Что сделать сегодня</h2>
@@ -361,9 +483,17 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         return 2
     snps = parse_raw(src)
     markers = build_markers(snps)
+    ref_hits = None
+    if args.refs_dir:
+        refs_dir = Path(args.refs_dir)
+        if refs_dir.exists():
+            ref_hits = load_reference_hits(snps, refs_dir, max_hits=args.refs_max)
+            print(f"Reference hits: {sum(len(v) for v in ref_hits.values())} (from {refs_dir})")
+        else:
+            print(f"warning: refs dir not found: {refs_dir}", file=sys.stderr)
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(render_html(snps, markers), encoding="utf-8")
+    out.write_text(render_html(snps, markers, ref_hits=ref_hits), encoding="utf-8")
     print(f"HTML report: {out}")
     if args.md:
         md = Path(args.md)
@@ -374,19 +504,47 @@ def cmd_analyze(args: argparse.Namespace) -> int:
 
 
 
+def print_refs_info() -> None:
+    print("Full-reference mode downloads public databases for a deeper local report.")
+    print("Why: the built-in panel is practical; GWAS/ClinVar add broad research/clinical-reference matches.")
+    print("Privacy: these are public references; your DNA file stays local and is not uploaded.")
+    print()
+    for key, meta in REF_SOURCES.items():
+        print(f"{key}: {meta['name']}")
+        print(f"  URL:  {meta['url']}")
+        print(f"  File: {meta['file']}")
+        print(f"  Size: {meta['size']}")
+        print(f"  Use:  {meta['why']}")
+        print()
+
+
+def cmd_refs_info(args: argparse.Namespace) -> int:
+    print_refs_info()
+    print("Download everything:")
+    print("  python3 bin/chip_atlas.py download-refs --all --dir data --yes")
+    print("Then generate expanded report:")
+    print("  python3 bin/chip_atlas.py analyze raw.txt --refs-dir data --out output/full_report.html --md output/full_report.md")
+    return 0
+
+
 def cmd_download_refs(args: argparse.Namespace) -> int:
     """Download optional public reference files for advanced/local experimentation."""
     data_dir = Path(args.dir)
-    print("Optional references are NOT required for the default human HTML report.")
-    print("They are downloaded only if you want to build your own expanded annotation pipeline.")
+    print_refs_info()
     jobs = []
     if args.gwas or args.all:
-        jobs.append(("gwas", data_dir / "gwas_catalog.tsv"))
+        jobs.append(("gwas", data_dir / REF_SOURCES["gwas"]["file"]))
     if args.clinvar or args.all:
-        jobs.append(("clinvar", data_dir / "clinvar.vcf.gz"))
+        jobs.append(("clinvar", data_dir / REF_SOURCES["clinvar"]["file"]))
     if not jobs:
-        print("Nothing selected. Use --all, --gwas, or --clinvar.")
+        print("Nothing selected. Use --all, --gwas, or --clinvar. Use refs-info to see concrete links.")
         return 2
+    if not args.yes:
+        print("This can download hundreds of MB or more. Continue? [y/N] ", end="")
+        answer = input().strip().lower()
+        if answer not in {"y", "yes", "д", "да"}:
+            print("cancelled")
+            return 1
     for key, dest in jobs:
         if dest.exists() and not args.force:
             print(f"skip existing: {dest}")
@@ -394,6 +552,9 @@ def cmd_download_refs(args: argparse.Namespace) -> int:
         print(f"Downloading {key}: {REF_URLS[key]}")
         download_url(REF_URLS[key], dest)
         print(f"saved: {dest}")
+    print()
+    print("Next step:")
+    print(f"  python3 bin/chip_atlas.py analyze path/to/raw_dna.txt --refs-dir {data_dir} --out output/full_report.html --md output/full_report.md")
     return 0
 
 
@@ -407,14 +568,20 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("input")
     a.add_argument("--out", "-o", default="output/chip_atlas_report.html")
     a.add_argument("--md", help="Optional Markdown output path")
+    a.add_argument("--refs-dir", default=None, help="Optional directory with downloaded GWAS/ClinVar references for expanded local annotation")
+    a.add_argument("--refs-max", type=int, default=80, help="Maximum hits per reference source to include in the report")
     a.set_defaults(func=cmd_analyze)
 
-    r = sub.add_parser("download-refs", help="Download optional public GWAS/ClinVar references (large; not needed for default report)")
+    ri = sub.add_parser("refs-info", help="Explain optional large references, concrete links, sizes, and full-report workflow")
+    ri.set_defaults(func=cmd_refs_info)
+
+    r = sub.add_parser("download-refs", help="Download optional public GWAS/ClinVar references for expanded reports")
     r.add_argument("--dir", default="data", help="Destination directory")
     r.add_argument("--all", action="store_true", help="Download all optional references")
     r.add_argument("--gwas", action="store_true", help="Download GWAS Catalog TSV")
     r.add_argument("--clinvar", action="store_true", help="Download ClinVar VCF.gz")
     r.add_argument("--force", action="store_true", help="Overwrite existing files")
+    r.add_argument("--yes", "-y", action="store_true", help="Do not ask for confirmation before large downloads")
     r.set_defaults(func=cmd_download_refs)
     return p
 
